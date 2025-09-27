@@ -1,0 +1,9 @@
+requests
+beautifulsoup4
+lxml
+markdown
+mistune
+dotenv
+html2text
+argparse
+tqdm

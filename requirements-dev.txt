@@ -1,0 +1,43 @@
+# Development dependencies for the Information Systems Documentation Processor
+
+# Core requirements (from requirements.txt)
+requests
+beautifulsoup4
+lxml
+markdown
+mistune
+python-dotenv
+html2text
+argparse
+tqdm
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-mock>=3.10.0
+pytest-asyncio>=0.21.0
+
+# Code Quality
+black>=23.0.0                # Code formatting
+flake8>=6.0.0                # Linting
+mypy>=1.0.0                  # Type checking
+bandit>=1.7.0                # Security linting
+isort>=5.12.0                # Import sorting
+
+# Development Tools
+pre-commit>=3.0.0            # Git hooks
+ipython>=8.0.0               # Enhanced REPL
+jupyter>=1.0.0               # Notebooks for exploration
+
+# Documentation
+sphinx>=6.0.0                # Documentation generation
+sphinx-rtd-theme>=1.2.0      # ReadTheDocs theme
+
+# Optional performance profiling
+memory-profiler>=0.61.0      # Memory usage profiling
+line-profiler>=4.0.0         # Line-by-line profiling
+
+# API development/testing
+httpx>=0.24.0                # Modern HTTP client
+responses>=0.23.0            # HTTP request mocking
+factory-boy>=3.2.0           # Test data factories
