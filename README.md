@@ -116,7 +116,7 @@ python main.py status
 ## 📁 Directory Structure
 
 ```
-IS/
+ConfluenceToOutline/
 ├── zips/                  # Confluence export ZIP files
 │   ├── Confluence-space-export-135853.html.zip
 │   └── Confluence-space-export-204041.html.zip
@@ -195,22 +195,13 @@ python main.py api-upload \
 If you have an existing setup using the old workflow:
 
 ```bash
-# OLD (archive/legacy_main.py)
-python archive/legacy_main.py extract-zips
-python archive/legacy_main.py api-upload --html-dir output/cleaned --collection-name "Space Name"
 
-# NEW (main.py)  
 python main.py extract-zips
 python main.py process-input
 python main.py extract-content --spaces is gi
 python main.py api-upload --spaces is gi
 ```
 
-**Benefits of new approach:**
-- **Reviewable output** - Edit JSON before upload
-- **Resumable operations** - No lost progress on failures  
-- **Better error handling** - Clear status and progress tracking
-- **Cleaner content** - Proper structure parsing from source HTML
 
 ## 🛠️ Development
 
@@ -266,7 +257,7 @@ python main.py status
 
 ## 📝 License
 
-[Your License Here]
+GNU AFFERO GENERAL PUBLIC LICENSE
 
 ## 🤝 Contributing  
 
