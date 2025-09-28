@@ -44,7 +44,7 @@ class ApiUploadManager:
         self.logger = logging.getLogger(__name__)
         # Don't set up logging configuration here - it should be done by the calling application
         
-    def upload_space(self, space_key: str) -> bool:
+    def upload_space(self, space_key: str, force_mode: bool = False) -> bool:
         """
         Upload a complete space to the API
         
@@ -74,7 +74,13 @@ class ApiUploadManager:
             # Step 1: Create the collection for this space
             collection_id = self._create_collection_for_space(space_data)
             if not collection_id:
-                self.logger.error(f"Failed to create collection for space: {space_key}")
+                error_msg = f"Failed to create collection for space: {space_key}"
+                self._track_collection_failure(space_data, error_msg)
+                self.logger.error(error_msg)
+                # Save the failure state
+                space_file = self.output_dir / f"{space_key}.json"
+                with open(space_file, 'w', encoding='utf-8') as f:
+                    json.dump(space_data, f, indent=2, ensure_ascii=False)
                 return False
                 
             # Step 2: Upload all content items as documents
@@ -83,7 +89,8 @@ class ApiUploadManager:
                 collection_id,
                 None,  # No parent document for root items
                 space_data,  # Pass space_data for attachment access
-                skip_root_space_page=True  # Skip the root space page
+                skip_root_space_page=True,  # Skip the root space page
+                force_mode=force_mode  # Pass force mode flag
             )
             
             # Always save partial progress, even if not completely successful
@@ -123,15 +130,36 @@ class ApiUploadManager:
     
     def _create_collection_for_space(self, space_data: Dict[str, Any]) -> Optional[str]:
         """
-        Create a single collection for the entire space
+        Create a single collection for the entire space, or use existing one if found
         The space root page content goes into the collection description
         
         Args:
             space_data: Complete space data from JSON
             
         Returns:
-            Collection ID if successful, None otherwise
+            Collection ID if successful (existing or newly created), None otherwise
         """
+        space_name = space_data["space_name"]
+        
+        # First, check if we already have a collection_id stored from previous runs
+        stored_collection_id = space_data.get("processing_stats", {}).get("collection_id")
+        if stored_collection_id:
+            # Verify the stored collection still exists and is accessible
+            if self._check_collection_exists(stored_collection_id, space_name):
+                self.logger.info(f"Using stored collection ID from previous run '{space_name}' (ID: {stored_collection_id})")
+                return stored_collection_id
+            else:
+                self.logger.warning(f"Stored collection ID {stored_collection_id} no longer valid, will search/create new one")
+        
+        # Check if a collection with this name already exists
+        existing_collection_id = self._find_existing_collection(space_name)
+        if existing_collection_id:
+            self.logger.info(f"Found existing collection '{space_name}' (ID: {existing_collection_id})")
+            return existing_collection_id
+        
+        # No existing collection found, create a new one
+        self.logger.info(f"Creating new collection for space: {space_name}")
+        
         url = f"{self.api_base_url}/api/collections.create"
         
         # Find the root space page content to use as description
@@ -154,7 +182,7 @@ class ApiUploadManager:
             "icon": "collection"  # Default icon
         }
         
-        response = self.session.post(url, json=payload)
+        response = self._make_api_request_with_retry('POST', url, json=payload)
         
         if response.status_code == 200:
             data = response.json()
@@ -163,11 +191,323 @@ class ApiUploadManager:
                 self.logger.info(f"Created collection: {space_data['space_name']} (ID: {collection_id})")
                 return collection_id
             else:
-                self.logger.error(f"API returned ok=false: {data.get('error', 'Unknown error')}")
+                error_msg = data.get('error', 'Unknown error')
+                self.logger.error(f"API returned ok=false: {error_msg}")
                 return None
         else:
             self.logger.error(f"Failed to create collection {space_data['space_name']}: {response.status_code} {response.text}")
             return None
+    
+    def _list_collections(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        List all collections using the Outline API
+        
+        Returns:
+            List of collection data dictionaries if successful, None otherwise
+        """
+        url = f"{self.api_base_url}/api/collections.list"
+        
+        try:
+            response = self._make_api_request_with_retry('POST', url, json={})
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("ok"):
+                    collections = data.get("data", [])
+                    self.logger.debug(f"Retrieved {len(collections)} collections from API")
+                    return collections
+                else:
+                    self.logger.error(f"API returned ok=false when listing collections: {data.get('error', 'Unknown error')}")
+                    return None
+            else:
+                self.logger.error(f"Failed to list collections: {response.status_code} {response.text}")
+                return None
+                
+        except Exception as e:
+            self.logger.error(f"Exception occurred while listing collections: {str(e)}")
+            return None
+    
+    def _find_existing_collection(self, space_name: str) -> Optional[str]:
+        """
+        Find an existing collection by exact name match
+        
+        Args:
+            space_name: The space name to search for (exact match)
+            
+        Returns:
+            Collection ID if found, None otherwise
+        """
+        collections = self._list_collections()
+        if not collections:
+            self.logger.debug("No collections retrieved, assuming none exist")
+            return None
+            
+        # Look for exact name matches
+        matches = []
+        for collection in collections:
+            if collection.get("name") == space_name:
+                matches.append(collection)
+        
+        if not matches:
+            self.logger.debug(f"No existing collection found with exact name '{space_name}'")
+            return None
+        elif len(matches) == 1:
+            # Single match - return the ID
+            collection_id = matches[0].get("id")
+            self.logger.info(f"Found existing collection '{space_name}' (ID: {collection_id})")
+            return collection_id
+        else:
+            # Multiple matches - need to resolve ambiguity
+            self.logger.warning(f"Found {len(matches)} collections with name '{space_name}' - resolving ambiguity")
+            selected_collection = self._handle_collection_ambiguity(matches, space_name)
+            if selected_collection:
+                collection_id = selected_collection.get("id")
+                self.logger.info(f"User selected collection '{space_name}' (ID: {collection_id})")
+                return collection_id
+            else:
+                self.logger.info("User chose to quit - no collection selected")
+                return None
+    
+    def _handle_collection_ambiguity(self, matches: List[Dict[str, Any]], space_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Present user with collection choices when multiple collections have the same name
+        
+        Args:
+            matches: List of collection dictionaries with matching names
+            space_name: The space name being searched for
+            
+        Returns:
+            Selected collection dictionary or None if user quits
+        """
+        print(f"\n⚠️  Ambiguous Collections Identified for '{space_name}':")
+        
+        # Display options with details
+        for i, collection in enumerate(matches, 1):
+            collection_id = collection.get("id", "unknown")
+            # Try to get document count if available
+            doc_count = "unknown"
+            if "documents" in collection:
+                doc_count = str(len(collection["documents"]))
+            elif "documentCount" in collection:
+                doc_count = str(collection["documentCount"])
+            
+            print(f"  {i}. {space_name} UUID=\"{collection_id}\" documents={doc_count}")
+        
+        # Get user selection
+        while True:
+            try:
+                choice = input(f"\nPlease select a target by number (1-{len(matches)}) OR 'Q/q' to quit: ").strip()
+                
+                if choice.lower() == 'q':
+                    return None
+                    
+                choice_num = int(choice)
+                if 1 <= choice_num <= len(matches):
+                    selected = matches[choice_num - 1]
+                    print(f"Selected: {space_name} (ID: {selected.get('id')})")
+                    return selected
+                else:
+                    print(f"❌ Please enter a number between 1 and {len(matches)}, or 'Q' to quit")
+                    
+            except ValueError:
+                print("❌ Please enter a valid number or 'Q' to quit")
+            except (EOFError, KeyboardInterrupt):
+                print("\n👋 Operation cancelled by user")
+                return None
+    
+    def _check_collection_exists(self, collection_id: str, expected_name: str) -> bool:
+        """
+        Check if a collection exists and has the expected name
+        
+        Args:
+            collection_id: The collection UUID to check
+            expected_name: The expected name of the collection
+            
+        Returns:
+            True if collection exists and name matches, False otherwise
+        """
+        if not collection_id or not collection_id.strip():
+            return False
+            
+        collections = self._list_collections()
+        if not collections:
+            return False
+            
+        # Look for the collection by ID and verify name
+        for collection in collections:
+            if collection.get("id") == collection_id:
+                if collection.get("name") == expected_name:
+                    self.logger.debug(f"Collection {collection_id} exists with expected name '{expected_name}'")
+                    return True
+                else:
+                    self.logger.warning(f"Collection {collection_id} exists but name mismatch: expected '{expected_name}', got '{collection.get('name')}'")
+                    return False
+                    
+        self.logger.debug(f"Collection {collection_id} not found in collection list")
+        return False
+    
+    def _track_document_failure(self, item: Dict[str, Any], error_message: str) -> None:
+        """
+        Track a document processing failure in the item data
+        
+        Args:
+            item: The document item that failed
+            error_message: The error message to record
+        """
+        if "processing_errors" not in item:
+            item["processing_errors"] = []
+        
+        error_record = {
+            "timestamp": datetime.now().isoformat(),
+            "error": error_message,
+            "retry_count": len(item["processing_errors"])  # Count of previous failures
+        }
+        
+        item["processing_errors"].append(error_record)
+        item["created"] = False  # Mark as not created due to error
+        
+        self.logger.error(f"Document processing failure recorded for '{item['title']}': {error_message}")
+    
+    def _track_collection_failure(self, space_data: Dict[str, Any], error_message: str) -> None:
+        """
+        Track a collection-level failure in the space data
+        
+        Args:
+            space_data: The space data dictionary
+            error_message: The error message to record
+        """
+        if "processing_stats" not in space_data:
+            space_data["processing_stats"] = {}
+        if "collection_errors" not in space_data["processing_stats"]:
+            space_data["processing_stats"]["collection_errors"] = []
+        
+        error_record = {
+            "timestamp": datetime.now().isoformat(),
+            "error": error_message
+        }
+        
+        space_data["processing_stats"]["collection_errors"].append(error_record)
+        self.logger.error(f"Collection processing failure recorded: {error_message}")
+    
+    def _make_api_request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
+        """
+        Make an API request with retry logic for rate limiting (429 errors)
+        
+        Args:
+            method: HTTP method ('GET', 'POST', etc.)
+            url: The API endpoint URL
+            **kwargs: Additional arguments to pass to requests method
+            
+        Returns:
+            Response object from successful request
+            
+        Raises:
+            Exception: If all retries are exhausted or non-429 error occurs
+        """
+        import time
+        import random
+        
+        max_retries = 5
+        base_delay = 1  # Base delay in seconds
+        max_delay = 60  # Maximum delay in seconds
+        
+        for attempt in range(max_retries + 1):
+            try:
+                # Make the request
+                response = self.session.request(method, url, **kwargs)
+                
+                if response.status_code == 429:
+                    if attempt == max_retries:
+                        self.logger.error(f"Rate limiting: Exhausted all {max_retries} retries for {url}")
+                        raise Exception(f"Rate limited after {max_retries} retries")
+                    
+                    # Calculate delay with exponential backoff + jitter
+                    delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
+                    
+                    # Check if server provided retry-after header
+                    retry_after = response.headers.get('Retry-After')
+                    if retry_after:
+                        try:
+                            delay = max(delay, float(retry_after))
+                        except ValueError:
+                            pass  # Use calculated delay if header is not a number
+                    
+                    self.logger.warning(f"Rate limited (429) on {url}, retrying in {delay:.2f}s (attempt {attempt + 1}/{max_retries + 1})")
+                    time.sleep(delay)
+                    continue
+                    
+                # Return response for all other status codes (let caller handle errors)
+                return response
+                
+            except requests.exceptions.RequestException as e:
+                if attempt == max_retries:
+                    self.logger.error(f"Request failed after {max_retries} retries: {e}")
+                    raise
+                
+                # Retry on network errors with shorter delay
+                delay = min(base_delay * (attempt + 1), 10)
+                self.logger.warning(f"Request failed ({e}), retrying in {delay}s (attempt {attempt + 1}/{max_retries + 1})")
+                time.sleep(delay)
+        
+        raise Exception("Unexpected: Should not reach this point")
+    
+    def _save_space_data_immediately(self, space_data: Dict[str, Any], reason: str = "") -> None:
+        """
+        Immediately save space data to JSON file (for force mode and critical updates)
+        
+        Args:
+            space_data: The space data dictionary to save
+            reason: Optional reason for the save (for logging)
+        """
+        try:
+            space_key = space_data.get("space_key", "unknown")
+            space_file = self.output_dir / f"{space_key}.json"
+            
+            with open(space_file, 'w', encoding='utf-8') as f:
+                json.dump(space_data, f, indent=2, ensure_ascii=False)
+            
+            if reason:
+                self.logger.debug(f"Space data saved immediately: {reason}")
+            else:
+                self.logger.debug(f"Space data saved immediately for {space_key}")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to save space data immediately: {str(e)}")
+    
+    def _check_document_exists(self, document_id: str) -> bool:
+        """
+        Check if a document exists by its UUID using the documents.info API
+        
+        Args:
+            document_id: The document UUID to check
+            
+        Returns:
+            True if document exists and is accessible, False otherwise
+        """
+        if not document_id or not document_id.strip():
+            return False
+            
+        url = f"{self.api_base_url}/api/documents.info"
+        payload = {"id": document_id}
+        
+        try:
+            response = self._make_api_request_with_retry('POST', url, json=payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("ok"):
+                    self.logger.debug(f"Document {document_id} exists and is accessible")
+                    return True
+                else:
+                    self.logger.debug(f"Document {document_id} does not exist or is not accessible")
+                    return False
+            else:
+                self.logger.debug(f"Failed to check document {document_id}: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            self.logger.debug(f"Exception occurred while checking document {document_id}: {str(e)}")
+            return False
     
     def _upload_documents_recursive(
         self, 
@@ -175,7 +515,8 @@ class ApiUploadManager:
         collection_id: str,
         parent_document_id: Optional[str],
         space_data: Dict[str, Any],
-        skip_root_space_page: bool = False
+        skip_root_space_page: bool = False,
+        force_mode: bool = False
     ) -> bool:
         """
         Recursively upload content items as documents
@@ -185,6 +526,7 @@ class ApiUploadManager:
             collection_id: ID of the collection to put documents in
             parent_document_id: ID of parent document (None for root items)
             skip_root_space_page: Whether to skip the first item (root space page)
+            force_mode: If True, ignore 'created' status and process all items
             
         Returns:
             True if all items uploaded successfully, False otherwise
@@ -206,30 +548,83 @@ class ApiUploadManager:
                         collection_id, 
                         None,  # No parent for root space page children
                         space_data,  # Pass space_data for attachment access
-                        skip_root_space_page=False  # Don't skip children
+                        skip_root_space_page=False,  # Don't skip children
+                        force_mode=force_mode  # Pass force mode down
                     )
                     if not success:
                         self.logger.warning(f"Some children failed for root space page: {item['title']}")
                 continue
             
-            # Check if already created
-            if item.get("created", False):
-                # Document is created, but check if there are pending attachments
+            # Check if document already exists (by UUID or created flag)
+            existing_uuid = item.get("page_uuid")
+            is_marked_created = item.get("created", False)
+            document_exists_in_api = False
+            
+            # If we have a UUID, check if document actually exists in the API
+            if existing_uuid and existing_uuid != collection_id:  # Don't check collection ID as document
+                document_exists_in_api = self._check_document_exists(existing_uuid)
+                if document_exists_in_api:
+                    self.logger.info(f"Document exists in API with UUID {existing_uuid}: {item['title']}")
+                else:
+                    self.logger.info(f"Document UUID {existing_uuid} not found in API, will recreate: {item['title']}")
+            
+            # Determine processing strategy based on existence and force mode
+            if force_mode and is_marked_created and document_exists_in_api and existing_uuid:
+                # FORCE MODE: Update existing document
+                document_id = existing_uuid
+                self.logger.info(f"FORCE MODE: Updating existing document: {item['title']} (UUID: {existing_uuid})")
+                
+                # Update document content
+                updated_content = item.get("md_content", "")
+                if not updated_content.strip():
+                    updated_content = f"# {item['title']}\n\nContent not available."
+                
+                # Update the document
+                update_success = self._update_document_content(document_id, item["title"], updated_content)
+                if update_success:
+                    self.logger.info(f"Successfully updated document content: {item['title']}")
+                    
+                    # Process attachments if any
+                    if item.get("attachments"):
+                        self.logger.info(f"Processing attachments for updated document: {item['title']}")
+                        self._upload_attachments_for_document(item, document_id, space_data)
+                else:
+                    error_msg = f"Failed to update document content: {item['title']}"
+                    self._track_document_failure(item, error_msg)
+                
+                # Process children regardless of update success
+                if item.get("children"):
+                    success = self._upload_documents_recursive(
+                        item["children"], 
+                        collection_id, 
+                        document_id,  # This document becomes the parent
+                        space_data,
+                        skip_root_space_page=False,
+                        force_mode=force_mode  # Pass force mode down
+                    )
+                    if not success:
+                        self.logger.warning(f"Some children failed for updated document: {item['title']}")
+                
+                continue
+                
+            elif not force_mode and ((is_marked_created and document_exists_in_api) or (is_marked_created and not existing_uuid)):
+                # NORMAL MODE: Skip existing documents but process attachments if needed
+                document_id = existing_uuid
+                
+                # Check if there are pending attachments
                 has_pending_attachments = self._has_pending_attachments(item)
                 
-                if has_pending_attachments:
+                if has_pending_attachments and document_id:
                     self.logger.info(f"Document already created but has pending attachments: {item['title']}")
-                    document_id = item.get("page_uuid")
-                    if document_id:
-                        # Try to upload pending attachments
-                        self._upload_attachments_for_document(item, document_id, space_data)
-                        
-                        # Save progress after attachment processing
-                        space_file = self.output_dir / f"{space_data['space_name']}.json"
-                        with open(space_file, 'w', encoding='utf-8') as f:
-                            json.dump(space_data, f, indent=2, ensure_ascii=False)
-                    else:
-                        self.logger.warning(f"Document {item['title']} marked as created but has no page_uuid")
+                    # Try to upload pending attachments
+                    self._upload_attachments_for_document(item, document_id, space_data)
+                    
+                    # Save progress after attachment processing
+                    space_file = self.output_dir / f"{space_data['space_key']}.json"
+                    with open(space_file, 'w', encoding='utf-8') as f:
+                        json.dump(space_data, f, indent=2, ensure_ascii=False)
+                elif not document_id:
+                    self.logger.warning(f"Document {item['title']} marked as created but has no valid page_uuid")
                 else:
                     self.logger.info(f"Skipping already created document (no pending attachments): {item['title']}")
                 
@@ -238,9 +633,10 @@ class ApiUploadManager:
                     success = self._upload_documents_recursive(
                         item["children"], 
                         collection_id, 
-                        item.get("page_uuid"),  # This document becomes the parent
+                        document_id,  # This document becomes the parent
                         space_data,
-                        skip_root_space_page=False
+                        skip_root_space_page=False,
+                        force_mode=force_mode  # Pass force mode down
                     )
                     if not success:
                         self.logger.warning(f"Some children failed for document: {item['title']}")
@@ -250,7 +646,8 @@ class ApiUploadManager:
             # Create this document
             success, document_id = self._create_document(item, collection_id, parent_document_id)
             if not success:
-                self.logger.error(f"Failed to create document: {item['title']}")
+                error_msg = f"Failed to create document: {item['title']}"
+                self._track_document_failure(item, error_msg)
                 # Continue processing other items instead of failing completely
                 continue
                 
@@ -260,6 +657,10 @@ class ApiUploadManager:
             item["created"] = True
             
             self.logger.info(f"Created document: {item['title']} (ID: {document_id})")
+            
+            # In force mode, immediately save progress to prevent data loss
+            if force_mode:
+                self._save_space_data_immediately(space_data, f"Document created: {item['title']}")
             
             # Upload attachments for this document
             if item.get("attachments") and document_id:
@@ -303,7 +704,8 @@ class ApiUploadManager:
                     collection_id, 
                     document_id,  # This document becomes the parent
                     space_data,  # Pass space_data for attachment access
-                    skip_root_space_page=False  # Don't skip children
+                    skip_root_space_page=False,  # Don't skip children
+                    force_mode=force_mode  # Pass force mode down
                 )
                 # Don't fail completely if children fail - continue with other items
                 if not success:
@@ -366,21 +768,7 @@ class ApiUploadManager:
             payload["parentDocumentId"] = parent_document_id
             
         try:
-            response = self.session.post(url, json=payload)
-            
-            # Handle rate limiting with exponential backoff
-            if response.status_code == 429:
-                self.logger.warning(f"Rate limit hit for document {title}, retrying with backoff...")
-                for retry in range(5):  # Increased retries
-                    wait_time = (2 ** retry) * 3  # 3, 6, 12, 24, 48 seconds
-                    self.logger.info(f"Waiting {wait_time} seconds before retry {retry + 1}/5")
-                    time.sleep(wait_time)
-                    response = self.session.post(url, json=payload)
-                    if response.status_code != 429:
-                        break
-                else:
-                    self.logger.error(f"Rate limit exceeded after 5 retries for document {title}")
-                    return False, None
+            response = self._make_api_request_with_retry('POST', url, json=payload)
             
             if response.status_code == 200:
                 data = response.json()
@@ -388,7 +776,8 @@ class ApiUploadManager:
                     document_id = data.get("data", {}).get("id")
                     return True, document_id
                 else:
-                    self.logger.error(f"API returned ok=false for document {title}: {data.get('error', 'Unknown error')}")
+                    error_msg = data.get('error', 'Unknown error')
+                    self.logger.error(f"API returned ok=false for document {title}: {error_msg}")
                     return False, None
             else:
                 error_text = response.text
@@ -425,17 +814,7 @@ class ApiUploadManager:
         }
         
         try:
-            response = self.session.post(url, json=payload)
-            
-            # Handle rate limiting
-            if response.status_code == 429:
-                self.logger.warning(f"Rate limit hit for document update {title}, retrying...")
-                for retry in range(3):
-                    wait_time = (2 ** retry) * 2
-                    time.sleep(wait_time)
-                    response = self.session.post(url, json=payload)
-                    if response.status_code != 429:
-                        break
+            response = self._make_api_request_with_retry('POST', url, json=payload)
             
             if response.status_code == 200:
                 data = response.json()
@@ -443,7 +822,8 @@ class ApiUploadManager:
                     self.logger.info(f"Successfully updated document content: {title}")
                     return True
                 else:
-                    self.logger.error(f"API returned ok=false for document update {title}: {data.get('error', 'Unknown error')}")
+                    error_msg = data.get('error', 'Unknown error')
+                    self.logger.error(f"API returned ok=false for document update {title}: {error_msg}")
                     return False
             else:
                 error_text = response.text
@@ -786,40 +1166,181 @@ class ApiUploadManager:
         attachment_details: Dict[str, Dict[str, Any]]
     ) -> str:
         """
-        Replace local attachment paths with API URLs in markdown content
+        Replace templated attachment paths with Outline API URLs in markdown content
+        Handles both templated format {attachments/path} and direct paths
         
         Args:
-            content: Original markdown content with local paths
+            content: Original markdown content with templated or direct paths
             attachment_details: Dictionary of attachment information
             
         Returns:
-            Updated markdown content with API URLs
+            Updated markdown content with proper Outline API URLs
         """
+        import re
         updated_content = content
         
         for original_path, details in attachment_details.items():
             if details.get("uploaded", False) and details.get("api_url"):
                 api_url = details["api_url"]
+                content_type = details.get("content_type", "")
+                file_name = details.get("name", original_path.split("/")[-1])
                 
-                # Simple string replacements for common patterns
-                patterns_to_replace = [
-                    f"![alt]({original_path})",
-                    f"]({original_path})",
-                    f"({original_path})",
-                    original_path
-                ]
+                # Determine if this is an image
+                is_image = content_type.startswith("image/") or any(
+                    original_path.lower().endswith(ext) 
+                    for ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.webp']
+                )
                 
-                replacements = [
-                    f"![alt]({api_url})",
-                    f"]({api_url})",
-                    f"({api_url})",
-                    api_url
-                ]
+                # Replace templated format {attachments/path} first
+                templated_path = f"{{{original_path}}}"
+                if templated_path in updated_content:
+                    if is_image:
+                        updated_content = self._replace_templated_image_references(
+                            updated_content, templated_path, api_url, file_name
+                        )
+                    else:
+                        updated_content = self._replace_templated_document_references(
+                            updated_content, templated_path, api_url, file_name
+                        )
                 
-                for old_pattern, new_replacement in zip(patterns_to_replace, replacements):
-                    updated_content = updated_content.replace(old_pattern, new_replacement)
+                # Also handle direct path references (fallback)
+                if is_image:
+                    updated_content = self._replace_image_references(updated_content, original_path, api_url, file_name)
+                else:
+                    updated_content = self._replace_document_references(updated_content, original_path, api_url, file_name)
         
         return updated_content
+    
+    def _replace_templated_image_references(self, content: str, templated_path: str, api_url: str, file_name: str) -> str:
+        """
+        Replace templated image references with proper Outline format
+        
+        Args:
+            content: Content to update
+            templated_path: Templated path like {attachments/path}
+            api_url: Outline API URL for the attachment
+            file_name: Original filename
+            
+        Returns:
+            Updated content with proper image markdown
+        """
+        import re
+        
+        # Pattern to match templated image formats in markdown
+        patterns = [
+            # ![alt](templated_path)
+            rf'!\[([^\]]*)\]\({re.escape(templated_path)}\)',
+            # ![](templated_path) 
+            rf'!\[\]\({re.escape(templated_path)}\)',
+        ]
+        
+        # Replace each pattern with proper Outline format
+        for pattern in patterns:
+            def replacement(match):
+                alt_text = match.group(1) if match.lastindex and match.lastindex >= 1 else ""
+                if not alt_text:
+                    alt_text = file_name.rsplit('.', 1)[0]  # Use filename without extension as alt
+                
+                return f'![{alt_text}]({api_url})'
+            
+            content = re.sub(pattern, replacement, content)
+        
+        return content
+    
+    def _replace_templated_document_references(self, content: str, templated_path: str, api_url: str, file_name: str) -> str:
+        """
+        Replace templated document attachment references with proper links
+        
+        Args:
+            content: Content to update
+            templated_path: Templated path like {attachments/path}
+            api_url: Outline API URL for the attachment
+            file_name: Original filename
+            
+        Returns:
+            Updated content with proper document links
+        """
+        # Simple string replacement for templated format
+        content = content.replace(templated_path, api_url)
+        return content
+    
+    def _replace_image_references(self, content: str, original_path: str, api_url: str, file_name: str) -> str:
+        """
+        Replace image references with proper Outline format
+        
+        Args:
+            content: Content to update
+            original_path: Original Confluence attachment path
+            api_url: Outline API URL for the attachment
+            file_name: Original filename
+            
+        Returns:
+            Updated content with proper image markdown
+        """
+        import re
+        
+        # Pattern to match various Confluence image formats
+        patterns = [
+            # Standard markdown image with alt text
+            rf'!\[([^\]]*)\]\({re.escape(original_path)}\)',
+            # Image with alt text and sizing (Confluence style)  
+            rf'!\[([^\]]*)\]\({re.escape(original_path)}\s*\"[^\"]*\"\)',
+            # Simple image reference
+            rf'!\[\]\({re.escape(original_path)}\)',
+            # Direct path references that should become images
+            rf'\({re.escape(original_path)}\)',
+        ]
+        
+        # Extract sizing information if present
+        size_match = re.search(rf'{re.escape(original_path)}\s*\"\s*=(\d+)x(\d+)', content)
+        size_attr = ""
+        if size_match:
+            width, height = size_match.groups()
+            size_attr = f' \" ={width}x{height}\"'
+        
+        # Replace each pattern with proper Outline format
+        for pattern in patterns:
+            def replacement(match):
+                alt_text = match.group(1) if match.lastindex and match.lastindex >= 1 else ""
+                if not alt_text:
+                    alt_text = file_name.rsplit('.', 1)[0]  # Use filename without extension as alt
+                
+                return f'![{alt_text}]({api_url}{size_attr})'
+            
+            content = re.sub(pattern, replacement, content)
+        
+        return content
+    
+    def _replace_document_references(self, content: str, original_path: str, api_url: str, file_name: str) -> str:
+        """
+        Replace document attachment references with proper links
+        
+        Args:
+            content: Content to update  
+            original_path: Original Confluence attachment path
+            api_url: Outline API URL for the attachment
+            file_name: Original filename
+            
+        Returns:
+            Updated content with proper document links
+        """
+        # Simple string replacements for documents
+        patterns_to_replace = [
+            f"]({original_path})",
+            f"({original_path})",
+            original_path
+        ]
+        
+        replacements = [
+            f"]({api_url})",
+            f"({api_url})", 
+            f"[{file_name}]({api_url})"
+        ]
+        
+        for old_pattern, new_replacement in zip(patterns_to_replace, replacements):
+            content = content.replace(old_pattern, new_replacement)
+        
+        return content
     
     def _prepare_content_with_attachments(self, item: Dict[str, Any]) -> str:
         """
@@ -847,21 +1368,88 @@ class ApiUploadManager:
             attachment_details
         )
         
-        # Then, ensure all uploaded attachments have references in the content
-        for attachment_path in attachments:
-            details = attachment_details.get(attachment_path, {})
-            if details.get("uploaded", False) and details.get("api_url"):
-                api_url = details["api_url"]
-                file_name = details.get("name", attachment_path.split("/")[-1])
-                
-                # Check if this attachment is already referenced in content
-                if api_url not in updated_content and attachment_path not in updated_content:
-                    # Add a reference to this attachment at the end of content
-                    attachment_link = f"\n\n📎 **Attachment:** [{file_name}]({api_url})"
-                    updated_content += attachment_link
-                    self.logger.info(f"Added missing attachment link for: {file_name}")
+        # Add unlinked attachments section
+        updated_content = self._add_unlinked_attachments_section(updated_content, attachment_details)
         
         return updated_content
+    
+    def _add_unlinked_attachments_section(self, content: str, attachment_details: Dict[str, Dict[str, Any]]) -> str:
+        """
+        Add an "Attachments" section for any attachments not referenced in the content
+        
+        Args:
+            content: Page content
+            attachment_details: Dictionary of attachment information
+            
+        Returns:
+            Content with attachments section appended if needed
+        """
+        unlinked_attachments = []
+        all_attachments = []
+        
+        for original_path, details in attachment_details.items():
+            if details.get("uploaded", False) and details.get("api_url"):
+                # Check if this attachment is referenced in the content
+                file_name = details.get("name", original_path.split("/")[-1])
+                api_url = details["api_url"]
+                templated_path = f"{{{original_path}}}"
+                
+                # Check if attachment is already referenced in content
+                is_linked = (
+                    original_path in content or 
+                    api_url in content or
+                    templated_path in content or
+                    f"]({original_path})" in content or
+                    f"({original_path})" in content
+                )
+                
+                content_type = details.get("content_type", "")
+                is_image = content_type.startswith("image/") or any(
+                    original_path.lower().endswith(ext) 
+                    for ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.webp']
+                )
+                
+                attachment_info = {
+                    "name": file_name,
+                    "url": api_url,
+                    "is_image": is_image,
+                    "content_type": content_type,
+                    "uuid": details.get("attachment_id", ""),
+                    "original_path": original_path
+                }
+                
+                all_attachments.append(attachment_info)
+                
+                if not is_linked:
+                    unlinked_attachments.append(attachment_info)
+        
+        # Add comprehensive attachments section 
+        if all_attachments:
+            attachments_section = "\n\n## Original Attachments\n\n"
+            
+            # Add unlinked attachments first if any exist
+            if unlinked_attachments:
+                attachments_section += "### Unlinked Attachments\n\n"
+                for attachment in unlinked_attachments:
+                    if attachment["is_image"]:
+                        # Show images directly
+                        attachments_section += f"![{attachment['name']}]({attachment['url']})\n\n"
+                    else:
+                        # Show documents as links
+                        attachments_section += f"- [{attachment['name']}]({attachment['url']})\n"
+                attachments_section += "\n"
+            
+            # Add detailed metadata for all attachments
+            attachments_section += "### Attachment Details\n\n"
+            for attachment in all_attachments:
+                attachments_section += f"- **Content Type:** {attachment['content_type']} "
+                attachments_section += f"**Original Name:** {attachment['name']} "
+                attachments_section += f"**Uploaded UUID:** {attachment['uuid']}\n"
+            
+            content += attachments_section
+            self.logger.info(f"Added attachments section with {len(unlinked_attachments)} unlinked of {len(all_attachments)} total attachments")
+        
+        return content
     
     def get_upload_status(self, space_key: str) -> Optional[Dict[str, Any]]:
         """

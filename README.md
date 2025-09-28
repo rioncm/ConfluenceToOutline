@@ -67,11 +67,17 @@ python main.py extract-content --spaces is gi
 ```bash
 # Upload specific spaces to Outline
 python main.py api-upload --spaces is gi
+
+# Force mode - update existing documents (bypasses 'created' status)
+python main.py api-upload --spaces is gi --force
 ```
 - Creates collections and pages via Outline API
 - Maintains proper parent-child relationships using UUIDs
 - Updates JSON files with creation status and UUIDs
 - **Resumable**: Skips already created items if upload is interrupted
+- **Force mode**: Updates existing documents with latest content
+- **Collection deduplication**: Handles duplicate collection names with user interaction
+- **Comprehensive retry logic**: Handles rate limiting and network errors with exponential backoff
 
 ## 📊 Status and Management
 
@@ -108,6 +114,9 @@ python main.py extract-content
 export OUTLINE_API_URL="https://your-outline.com/api"  
 export OUTLINE_API_TOKEN="your-token"
 python main.py api-upload --spaces is gi
+
+# 6. Update existing documents with latest content (force mode)
+python main.py api-upload --spaces is gi --force
 
 # 6. Check final status
 python main.py status
@@ -174,7 +183,16 @@ python main.py api-upload \
 - **Smart markdown conversion** from HTML
 - **Breadcrumb removal** - no more navigation clutter
 - **Title deduplication** - titles captured from structure, not content
-- **Attachment handling** - preserves file references
+- **Advanced attachment handling** - complete image and file support with Outline compatibility
+
+### ✅ Advanced Attachment & Image Support
+- **Automatic URL parameter removal** - strips `?width=760` and other Confluence query parameters
+- **Templated format conversion** - uses clean `{attachment/path}` system for UUID replacement
+- **Perfect Outline compatibility** - converts to proper `/api/attachments.redirect?id=UUID` format
+- **Unlinked attachment detection** - automatically adds attachment sections for orphaned files
+- **Comprehensive metadata tracking** - preserves content type, original names, and UUIDs
+- **Two-phase upload workflow** - creates attachment records then uploads to secure storage
+- **Proper markdown image syntax** - maintains alt text and sizing information
 
 ### ✅ Resumable API Operations
 - **UUID tracking** for created collections and pages
@@ -184,11 +202,14 @@ python main.py api-upload \
 
 ### ✅ Production Ready
 - **Comprehensive error handling** with detailed logging
-- **Rate limiting** to respect API constraints
+- **Advanced rate limiting** with exponential backoff and server header respect
+- **Force mode operations** for updating existing content and collections
+- **Interactive conflict resolution** for duplicate collection names
 - **Clean separation of concerns** for maintainability
 - **Flexible CLI** with intuitive commands
 - **Centralized configuration** with validation and type safety
 - **Environment variable support** with command-line overrides
+- **Complete attachment workflows** tested with 7+ production spaces
 
 ## 🔄 Migration from Legacy
 
@@ -243,10 +264,21 @@ python -m pytest test_data/
 - Verify API credentials and network connectivity
 - Check Outline instance is accessible
 - Review rate limiting (default 0.1s delay between requests)
+- It's recommended to disable rate limiting or setting the request value very high for this process.
 
 **"Upload interrupted"**
 - Use `python main.py reset --spaces <key>` to reset status
 - Or continue with same command - already created items will be skipped
+
+**"Attachments not displaying correctly"**
+- Re-run `extract-content` to update attachment URLs with latest format
+- Use `--force` mode to update existing pages: `python main.py api-upload --spaces <key> --force`
+- Check that attachment files exist in `input/Export-*/SPACE/attachments/` directories
+
+**"Images showing as broken links"**
+- Ensure images were successfully uploaded (check JSON for `"uploaded": true`)
+- Verify Outline instance supports the attachment redirect endpoint
+- Use force mode to refresh all attachment URLs
 
 ### Debug Mode
 ```bash

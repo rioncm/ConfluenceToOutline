@@ -154,9 +154,13 @@ def cmd_api_upload(args):
     print(f"=== UPLOADING {len(spaces_to_upload)} SPACES TO API ===")
     
     success_count = 0
+    force_mode = getattr(args, 'force', False)
+    if force_mode:
+        print("🔥 FORCE MODE ENABLED - Will process all documents regardless of 'created' status")
+    
     for space_key in spaces_to_upload:
         print(f"🚀 Uploading {space_key}...")
-        success = manager.upload_space(space_key)
+        success = manager.upload_space(space_key, force_mode=force_mode)
         if success:
             success_count += 1
             print(f"  ✅ {space_key} - Upload successful")
@@ -426,6 +430,11 @@ Environment Variables:
     upload_parser.add_argument(
         '--api-token',
         help='Outline API token (or set OUTLINE_API_TOKEN env var)'
+    )
+    upload_parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Force upload/update all collections and documents regardless of "created" status'
     )
     
     # Status command

@@ -8,7 +8,8 @@ import json
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
+from bs4.element import NavigableString
 import html2text
 import logging
 
@@ -244,12 +245,15 @@ class SpaceProcessor:
             # Find attachment links in the HTML
             attachment_links = soup.find_all('a', href=re.compile(r'attachments/'))
             for link in attachment_links:
-                href = link.get('href')
-                if href and href.startswith('attachments/'):
-                    # Clean up the path
-                    attachment_path = href.replace('../', '').replace('./', '')
-                    if attachment_path not in attachments:
-                        attachments.append(attachment_path)
+                # Type check to ensure we have a Tag element
+                if isinstance(link, Tag):
+                    href = link.get('href')
+                    # Type check to ensure href is a string
+                    if href and isinstance(href, str) and href.startswith('attachments/'):
+                        # Clean up the path
+                        attachment_path = href.replace('../', '').replace('./', '')
+                        if attachment_path not in attachments:
+                            attachments.append(attachment_path)
         
         return attachments
     
@@ -377,18 +381,25 @@ class SpaceProcessor:
         if not main_content:
             main_content = soup.find('body')
         
-        if main_content:
+        if main_content and isinstance(main_content, Tag):
             # Step 3: Clean up remaining navigation elements within content
             # Remove any remaining nav elements
             nav_elements = main_content.find_all(['nav', 'div'], 
                                                attrs={'class': re.compile(r'nav|menu|sidebar')})
             for nav in nav_elements:
-                nav.decompose()
+                if isinstance(nav, Tag):
+                    nav.decompose()
             
             # Remove any remaining breadcrumb-like lists at the beginning
             first_ol = main_content.find('ol')
-            if first_ol and first_ol.find('a', href='index.html'):
-                first_ol.decompose()
+            if first_ol and isinstance(first_ol, Tag):
+                # Check if this OL contains a link to index.html (breadcrumb indicator)
+                index_link = first_ol.find('a', {'href': 'index.html'})
+                if index_link:
+                    first_ol.decompose()
+            
+            # Step 3.5: Clean attachment URLs - strip query parameters and convert to template format
+            self._clean_attachment_urls_in_html(main_content)
             
             # Step 4: Convert to markdown
             markdown = self.html2text_converter.handle(str(main_content))
@@ -400,6 +411,49 @@ class SpaceProcessor:
         
         return f"Could not extract content from {html_file.name}"
     
+    def _clean_attachment_urls_in_html(self, soup_element: Tag) -> None:
+        """
+        Clean attachment URLs in HTML by stripping query parameters and converting to template format
+        
+        Args:
+            soup_element: BeautifulSoup element to process
+        """
+        import re
+        
+        # Find all img tags with src attributes containing attachments
+        img_elements = soup_element.find_all('img', src=re.compile(r'attachments/'))
+        
+        # Find all a tags with href attributes containing attachments  
+        a_elements = soup_element.find_all('a', href=re.compile(r'attachments/'))
+        
+        # Process img elements
+        for element in img_elements:
+            if isinstance(element, Tag):
+                url = element.get('src')
+                if url and 'attachments/' in url and isinstance(url, str):
+                    # Strip query parameters (everything after ?)
+                    base_url = url.split('?')[0]
+                    
+                    # Convert to template format for later UUID replacement
+                    template_url = f"{{{base_url}}}"
+                    element['src'] = template_url
+                    
+                    self.logger.debug(f"Converted img src: {url} -> {template_url}")
+        
+        # Process a elements
+        for element in a_elements:
+            if isinstance(element, Tag):
+                url = element.get('href')
+                if url and 'attachments/' in url and isinstance(url, str):
+                    # Strip query parameters (everything after ?)
+                    base_url = url.split('?')[0]
+                    
+                    # Convert to template format for later UUID replacement
+                    template_url = f"{{{base_url}}}"
+                    element['href'] = template_url
+                    
+                    self.logger.debug(f"Converted a href: {url} -> {template_url}")
+
     def clean_markdown(self, markdown: str) -> str:
         """
         Clean up markdown content to remove artifacts from HTML conversion
