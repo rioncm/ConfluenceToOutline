@@ -42,8 +42,8 @@ class SpaceProcessor:
         self.html2text_converter.unicode_snob = True
         
         # Set up logging
-        logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
+        # Don't set up logging configuration here - it should be done by the calling application
         
     def process_input_directories(self) -> List[str]:
         """

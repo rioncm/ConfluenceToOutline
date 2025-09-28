@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#! venv/bin/python3
 """
 Main CLI Interface for the new SpaceProcessor workflow
 Implements the clean architecture approach for Confluence space processing
@@ -13,6 +13,7 @@ from libs.space_processor import SpaceProcessor
 from libs.api_upload_manager import ApiUploadManager
 from libs.zip_extractor import ZipExtractor
 from libs.config import AppConfig
+from libs.logger import setup_logging
 
 # Load environment variables from .env file
 dotenv.load_dotenv('.env')
@@ -21,6 +22,11 @@ dotenv.load_dotenv('.env')
 def cmd_extract_zips(args):
     """Extract ZIP files from zips/ directory to input/ directory"""
     config = AppConfig.from_args(args)
+    
+    # Set up logging
+    logger = setup_logging(config.logging.log_level, config.logging.log_file)
+    logger.info(f"Starting ZIP extraction with log level: {config.logging.get_level_name()}")
+    
     base_path = Path(args.base_path)
     
     print("=== EXTRACTING ZIP FILES ===")
@@ -51,6 +57,12 @@ def cmd_extract_zips(args):
 
 def cmd_process_input(args):
     """Process input directories and create space JSON files"""
+    config = AppConfig.from_args(args)
+    
+    # Set up logging
+    logger = setup_logging(config.logging.log_level, config.logging.log_file)
+    logger.info(f"Starting input processing with log level: {config.logging.get_level_name()}")
+    
     processor = SpaceProcessor(Path(args.base_path))
     
     print("=== PROCESSING INPUT DIRECTORIES ===")
@@ -74,6 +86,12 @@ def cmd_process_input(args):
 
 def cmd_extract_content(args):
     """Extract markdown content for specified spaces"""
+    config = AppConfig.from_args(args)
+    
+    # Set up logging
+    logger = setup_logging(config.logging.log_level, config.logging.log_file)
+    logger.info(f"Starting content extraction with log level: {config.logging.get_level_name()}")
+    
     processor = SpaceProcessor(Path(args.base_path))
     
     # Get list of spaces to process
@@ -106,6 +124,11 @@ def cmd_extract_content(args):
 def cmd_api_upload(args):
     """Upload spaces to API"""
     config = AppConfig.from_args(args)
+    
+    # Set up logging FIRST
+    logger = setup_logging(config.logging.log_level, config.logging.log_file)
+    logger.info(f"Starting API upload with log level: {config.logging.get_level_name()}")
+    logger.debug(f"Configuration: {config.to_dict()}")
     
     # Override config with command line arguments if provided
     if args.api_url:
@@ -186,6 +209,18 @@ def cmd_status(args):
                 if upload_status:
                     completion = upload_status['completion_percentage']
                     print(f"   🚀 Upload: {upload_status['created_items']}/{upload_status['total_items']} items ({completion:.1f}%)")
+                    
+                    # Show attachment statistics if available
+                    attachment_stats = upload_status.get('attachment_stats', {})
+                    if attachment_stats.get('total_attachments', 0) > 0:
+                        total_att = attachment_stats['total_attachments']
+                        uploaded_att = attachment_stats['uploaded_attachments']
+                        failed_att = attachment_stats['failed_attachments']
+                        print(f"   📎 Attachments: {uploaded_att}/{total_att} uploaded", end="")
+                        if failed_att > 0:
+                            print(f", {failed_att} failed")
+                        else:
+                            print("")
     
     return 0
 

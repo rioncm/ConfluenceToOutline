@@ -4,9 +4,26 @@ Configuration management for the Confluence processing system.
 This module provides centralized configuration with validation and type safety.
 """
 import os
+import logging
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 from pathlib import Path
+
+
+@dataclass
+class LoggingConfig:
+    """Logging configuration."""
+    log_level: int = field(default_factory=lambda: getattr(logging, os.getenv('LOG_LEVEL', 'INFO').upper(), logging.INFO))
+    log_file: Optional[str] = field(default_factory=lambda: os.getenv('LOG_FILE'))
+    
+    def get_level_name(self) -> str:
+        """Get the logging level name."""
+        return logging.getLevelName(self.log_level)
+    
+    @classmethod
+    def from_args(cls, args) -> 'LoggingConfig':
+        """Create config from command line arguments."""
+        return cls()
 
 
 @dataclass
@@ -122,6 +139,7 @@ class APIConfig:
 @dataclass
 class AppConfig:
     """Main application configuration combining all sub-configs."""
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     directories: DirectoryConfig = field(default_factory=DirectoryConfig) 
@@ -131,6 +149,7 @@ class AppConfig:
     def from_args(cls, args) -> 'AppConfig':
         """Create complete config from command line arguments."""
         return cls(
+            logging=LoggingConfig.from_args(args),
             processing=ProcessingConfig.from_args(args),
             directories=DirectoryConfig.from_args(args),
             api=APIConfig()
@@ -139,6 +158,10 @@ class AppConfig:
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary for logging/debugging."""
         return {
+            'logging': {
+                'log_level': self.logging.get_level_name(),
+                'log_file': self.logging.log_file
+            },
             'processing': {
                 'preserve_breadcrumbs': self.processing.preserve_breadcrumbs,
                 'preserve_titles': self.processing.preserve_titles,
